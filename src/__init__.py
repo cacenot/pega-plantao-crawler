@@ -1,1 +1,1 @@
-"""Pega Plantão Crawler - Web scraper usando Playwright e httpx."""
+"""Pega Plantão Crawler — Crawlers para PegaPlantão e CFM."""
