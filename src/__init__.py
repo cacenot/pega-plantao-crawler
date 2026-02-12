@@ -1,1 +1,1 @@
-"""Pega Plantão Crawler — Crawlers para PegaPlantão e CFM."""
+"""QP Data Service — Serviço de consulta e coleta de dados médicos."""

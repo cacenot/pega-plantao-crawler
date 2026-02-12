@@ -1,7 +1,7 @@
 services:
   postgres:
     image: postgres:16-alpine
-    container_name: qp_crawler_postgres
+    container_name: qp-data-service-postgres
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-qp_crawler}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}

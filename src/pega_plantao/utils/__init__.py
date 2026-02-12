@@ -1,1 +1,0 @@
-"""Utilitários do Pega Plantão."""
