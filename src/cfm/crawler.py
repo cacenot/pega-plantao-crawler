@@ -65,6 +65,7 @@ UFS = [
 CFM_BASE_URL = "https://portal.cfm.org.br"
 CFM_BUSCA_URL = f"{CFM_BASE_URL}/api_rest_php/api/v2/medicos/buscar_medicos"
 CFM_FOTO_URL = f"{CFM_BASE_URL}/api_rest_php/api/v2/medicos/buscar_foto/"
+CFM_MUNICIPIOS_URL = f"{CFM_BASE_URL}/api_rest_php/api/v2/medicos/listar_municipios"
 CFM_PAGE_URL = f"{CFM_BASE_URL}/busca-medicos"
 
 
@@ -784,6 +785,170 @@ async def run_execution(
         print(f"\n\n🛑 Interrompido pelo usuário. Execução #{execution_id} pausada.")
         await pause_execution(db_pool, execution_id)
         raise
+
+    return total_medicos
+
+
+async def fetch_municipios(
+    client: httpx.AsyncClient,
+    uf: str,
+) -> list[dict]:
+    """Busca a lista de municípios de uma UF via API do CFM.
+
+    Returns:
+        Lista de dicts com 'id' e 'name' de cada município.
+    """
+    url = f"{CFM_MUNICIPIOS_URL}/{uf}"
+    try:
+        resp = await client.get(url, timeout=30)
+        data = resp.json()
+    except Exception as e:
+        raise Exception(f"Erro ao buscar municípios de {uf}: {e}")
+
+    dados = data.get("dados", [])
+    return [
+        {"id": m["ID_MUNICIPIO"], "name": m["DS_MUNICIPIO"]}
+        for m in dados
+        if "ID_MUNICIPIO" in m and "DS_MUNICIPIO" in m
+    ]
+
+
+async def crawl_state_by_cities(
+    client: httpx.AsyncClient,
+    uf: str,
+    cities: list[dict],
+    db_pool: asyncpg.Pool,
+    page_size: int = 100,
+    batch_size: int = 5,
+    delay: float = 0.8,
+    request_timeout: int = 120,
+) -> int:
+    """Crawla todos os médicos de uma UF iterando por município.
+
+    Para cada cidade, descobre o total de páginas e busca em batches.
+    Sem tracking granular por cidade — execução linear.
+
+    Returns:
+        Total de médicos processados.
+    """
+    total_medicos = 0
+    total_start_time = time.time()
+    skipped_cities = 0
+
+    # Obter token uma vez antes do loop
+    captcha_token = await _get_captcha_token(db_pool)
+
+    async def _refresh_token() -> str:
+        """Revalida e retorna o token silenciosamente."""
+        if not await _validate_captcha_token(db_pool):
+            print("\n❌ Token do captcha expirou! Execute: uv run cfm token")
+            raise RuntimeError("Token do captcha expirado durante o crawl.")
+        token = await captcha_db.get_token(db_pool)
+        if not token:
+            raise RuntimeError(
+                "❌ Token do captcha não encontrado ou expirado!\n"
+                "   Execute primeiro: uv run cfm token"
+            )
+        return token
+
+    for city_idx, city in enumerate(cities, 1):
+        city_id = city["id"]
+        city_name = city["name"]
+
+        # Revalidar captcha silenciosamente
+        captcha_token = await _refresh_token()
+
+        # Página 1 para descobrir total
+        try:
+            first_page_medicos, total_count = await fetch_medicos_page(
+                client=client,
+                captcha_token=captcha_token,
+                uf=uf,
+                municipio=city_id,
+                current_page=1,
+                page_size=page_size,
+                request_timeout=request_timeout,
+            )
+        except Exception as e:
+            print(f"⚠️  [{city_idx}/{len(cities)}] Erro ao consultar {city_name}: {e}")
+            continue
+
+        if total_count == 0:
+            skipped_cities += 1
+            continue
+
+        total_pages = math.ceil(total_count / page_size)
+
+        # Processar página 1
+        city_medicos = 0
+        if first_page_medicos:
+            batch_docs: list[dict] = []
+            for raw in first_page_medicos:
+                raw_data = raw.model_dump(mode="json", by_alias=True)
+                doc = _format_doctor_for_db(raw, raw_data=raw_data, foto=None)
+                batch_docs.append(doc)
+            if batch_docs:
+                await upsert_doctors_batch(db_pool, batch_docs)
+                city_medicos += len(batch_docs)
+
+        # Buscar páginas restantes em batches
+        remaining_pages = list(range(2, total_pages + 1))
+
+        for i in range(0, len(remaining_pages), batch_size):
+            batch_pages = remaining_pages[i : i + batch_size]
+
+            # Revalidar captcha silenciosamente
+            captcha_token = await _refresh_token()
+
+            try:
+                results = await _fetch_batch(
+                    client=client,
+                    captcha_token=captcha_token,
+                    uf=uf,
+                    pages=batch_pages,
+                    page_size=page_size,
+                    request_timeout=request_timeout,
+                    municipio=city_id,
+                )
+            except Exception as e:
+                print(f"⚠️  Erro no batch para {city_name}: {e}")
+                continue
+
+            batch_docs = []
+            for _page_num, raw_medicos, _page_total in results:
+                if raw_medicos:
+                    for raw in raw_medicos:
+                        raw_data = raw.model_dump(mode="json", by_alias=True)
+                        doc = _format_doctor_for_db(raw, raw_data=raw_data, foto=None)
+                        batch_docs.append(doc)
+
+            if batch_docs:
+                await upsert_doctors_batch(db_pool, batch_docs)
+                city_medicos += len(batch_docs)
+
+            await asyncio.sleep(delay)
+
+        total_medicos += city_medicos
+        elapsed = time.time() - total_start_time
+        elapsed_str = f"{int(elapsed // 60)}m{int(elapsed % 60)}s"
+
+        print(
+            f"📡 [{city_idx}/{len(cities)}] {city_name}: "
+            f"{city_medicos} médicos ({total_pages}pg) | "
+            f"Total: {total_medicos} | ⏱️ {elapsed_str}"
+        )
+
+    total_time = time.time() - total_start_time
+    total_minutes = int(total_time / 60)
+    total_seconds = int(total_time % 60)
+
+    print(f"\n{'=' * 60}")
+    print(f"✅ Crawl de {uf} por cidades finalizado!")
+    print(f"   🏙️  Cidades com médicos: {len(cities) - skipped_cities}/{len(cities)}")
+    print(f"   🔹 Cidades sem registros: {skipped_cities}")
+    print(f"   👤 Total de médicos: {total_medicos}")
+    print(f"   ⏱️  Tempo total: {total_minutes}m {total_seconds}s")
+    print(f"{'=' * 60}")
 
     return total_medicos
 

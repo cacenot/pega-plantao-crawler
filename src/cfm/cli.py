@@ -3,6 +3,7 @@
 Subcomandos:
     create         — Criar um plano de execução (form interativo)
     execute        — Criar e executar de uma vez (form interativo)
+    execute-state  — Crawlar um estado inteiro por município (form interativo)
     run            — Iniciar/continuar uma execução
     list           — Listar execuções ativas
     show           — Visualizar detalhes de uma execução
@@ -305,6 +306,162 @@ def execute() -> None:
 
     print(f"\n✅ Execução #{execution_id} criada. Iniciando...")
     asyncio.run(_run_execution(execution_id))
+
+
+# ── execute-state ──────────────────────────────────────────────
+
+
+def _execute_state_form() -> dict:
+    """Formulário interativo para configurar crawl por município.
+
+    Retorna dict com: uf, page_size, batch_size.
+    """
+    from InquirerPy import inquirer
+    from InquirerPy.base.control import Choice
+
+    from .config import get_cfm_settings
+
+    settings = get_cfm_settings()
+
+    print("\n" + "=" * 60)
+    print("📋 CFM - Executar Estado por Município")
+    print("=" * 60)
+
+    # ── UF (select único) ──────────────────────────────────────
+    uf = inquirer.select(
+        message="Selecione o estado (UF):",
+        choices=[
+            Choice(value=code, name=f"{code} - {name}")
+            for code, name in UFS_MAP.items()
+        ],
+        pointer="❯",
+    ).execute()
+
+    # ── Page size ──────────────────────────────────────────────
+    page_size = int(
+        inquirer.number(
+            message="Page size (registros por página):",
+            default=settings.page_size,
+            min_allowed=1,
+            max_allowed=25000,
+        ).execute()
+    )
+
+    # ── Batch size ─────────────────────────────────────────────
+    batch_size = int(
+        inquirer.number(
+            message="Batch size (páginas por batch paralelo):",
+            default=settings.batch_size,
+            min_allowed=1,
+            max_allowed=100,
+        ).execute()
+    )
+
+    # ── Resumo ─────────────────────────────────────────────────
+    print("\n" + "-" * 60)
+    print("📋 Resumo:")
+    print(f"   Estado:     {uf} - {UFS_MAP[uf]}")
+    print(f"   Page size:  {page_size}")
+    print(f"   Batch size: {batch_size}")
+    print("-" * 60)
+
+    return {
+        "uf": uf,
+        "page_size": page_size,
+        "batch_size": batch_size,
+    }
+
+
+@app.command(name="execute-state")
+def execute_state() -> None:
+    """Crawlar um estado inteiro iterando por todos os municípios."""
+    from InquirerPy import inquirer
+
+    form = _execute_state_form()
+
+    if not inquirer.confirm(message="🚀 Iniciar execução?", default=True).execute():
+        typer.echo("❌ Cancelado.")
+        raise typer.Exit()
+
+    asyncio.run(_run_execute_state(form))
+
+
+async def _run_execute_state(form: dict) -> None:
+    """Lógica async do subcomando execute-state."""
+    import time
+
+    from .config import get_cfm_settings
+    from .crawler import create_http_client, crawl_state_by_cities, fetch_municipios
+    from .db import captcha as captcha_db
+    from .db.connection import close_pool, create_pool
+    from .db.schema import ensure_tables
+
+    settings = get_cfm_settings()
+    uf = form["uf"]
+    page_size = form["page_size"]
+    batch_size = form["batch_size"]
+
+    pool = await create_pool(settings.database_url)
+    await ensure_tables(pool)
+
+    print("=" * 60)
+    print(f"🏥 CFM - Crawl por Município: {uf} - {UFS_MAP[uf]}")
+    print(f"📦 Page size: {page_size}")
+    print(f"⚡ Batch size: {batch_size}")
+    print(
+        f"🔗 Database: {settings.database_url.split('@')[-1] if '@' in settings.database_url else settings.database_url}"
+    )
+    print("=" * 60)
+
+    # Validar captcha
+    if not await captcha_db.is_valid(pool):
+        print("\n❌ Token de captcha não encontrado ou expirado!")
+        print("   Execute primeiro: uv run cfm token")
+        await close_pool()
+        return
+
+    ttl = await captcha_db.get_ttl(pool)
+    print(f"\n✅ Token de captcha encontrado (TTL: {ttl}s)")
+
+    client = create_http_client(timeout=settings.request_timeout)
+
+    try:
+        # Buscar municípios
+        print(f"\n🔍 Buscando municípios de {uf}...")
+        cities = await fetch_municipios(client, uf)
+
+        if not cities:
+            print(f"❌ Nenhum município encontrado para {uf}.")
+            return
+
+        print(f"✅ {len(cities)} municípios encontrados para {uf}")
+
+        start = time.time()
+        total_medicos = await crawl_state_by_cities(
+            client=client,
+            uf=uf,
+            cities=cities,
+            db_pool=pool,
+            page_size=page_size,
+            batch_size=batch_size,
+            delay=settings.delay,
+            request_timeout=settings.request_timeout,
+        )
+        elapsed = time.time() - start
+
+        print(f"\n🎉 Sessão finalizada! {total_medicos} médicos processados em {int(elapsed // 60)}m{int(elapsed % 60)}s")
+
+    except KeyboardInterrupt:
+        print("\n\n🛑 Interrompido pelo usuário.")
+    except RuntimeError as e:
+        if "captcha" in str(e).lower():
+            print("\n❌ Token do captcha expirou.")
+            print("   Execute: uv run cfm token")
+        else:
+            print(f"\n❌ Erro: {e}")
+    finally:
+        await client.aclose()
+        await close_pool()
 
 
 async def _create_execution(
