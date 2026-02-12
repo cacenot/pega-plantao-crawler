@@ -3,6 +3,7 @@
 Subcomandos:
     create         — Criar um plano de execução (form interativo)
     execute        — Criar e executar de uma vez (form interativo)
+    execute-crm    — Buscar médico específico por CRM/UF
     execute-state  — Crawlar um estado inteiro por município (form interativo)
     run            — Iniciar/continuar uma execução
     list           — Listar execuções ativas
@@ -308,6 +309,106 @@ def execute() -> None:
     asyncio.run(_run_execution(execution_id))
 
 
+# ── execute-crm ────────────────────────────────────────────────
+
+
+@app.command(name="execute-crm")
+def execute_crm(
+    crm: Annotated[
+        str,
+        typer.Option("--crm", help="Número do CRM do médico."),
+    ],
+    uf: Annotated[
+        str,
+        typer.Option("--uf", help="UF do CRM (ex: SC, SP, RJ)."),
+    ],
+) -> None:
+    """Buscar um médico específico por CRM e UF, exibir e salvar no banco."""
+    uf = uf.upper()
+    if uf not in UFS:
+        typer.echo(f"❌ UF inválida: {uf}")
+        raise typer.Exit(code=1)
+
+    asyncio.run(_run_execute_crm(crm=crm, uf=uf))
+
+
+async def _run_execute_crm(crm: str, uf: str) -> None:
+    """Lógica async do subcomando execute-crm."""
+    from .config import get_cfm_settings
+    from .crawler import create_http_client, fetch_medico_by_crm
+    from .db import captcha as captcha_db
+    from .db.connection import close_pool, create_pool
+    from .db.schema import ensure_tables
+
+    settings = get_cfm_settings()
+
+    pool = await create_pool(settings.database_url)
+    await ensure_tables(pool)
+
+    print("=" * 60)
+    print(f"🔍 CFM - Busca por CRM: {crm} / {uf}")
+    print("=" * 60)
+
+    # Validar captcha
+    if not await captcha_db.is_valid(pool):
+        print("\n❌ Token de captcha não encontrado ou expirado!")
+        print("   Execute primeiro: uv run cfm token")
+        await close_pool()
+        return
+
+    ttl = await captcha_db.get_ttl(pool)
+    print(f"✅ Token de captcha encontrado (TTL: {ttl}s)")
+
+    captcha_token = await captcha_db.get_token(pool)
+    client = create_http_client(timeout=settings.request_timeout)
+
+    try:
+        doc = await fetch_medico_by_crm(
+            client=client,
+            captcha_token=captcha_token,
+            crm=crm,
+            uf=uf,
+            db_pool=pool,
+            request_timeout=settings.request_timeout,
+            fetch_foto=settings.fetch_fotos,
+        )
+
+        if doc is None:
+            print(f"\n❌ Nenhum médico encontrado com CRM {crm}/{uf}.")
+            return
+
+        print("\n" + "=" * 60)
+        print("✅ Médico encontrado e salvo no banco!")
+        print("=" * 60)
+        print(f"  Nome:          {doc.get('name', '-')}")
+        print(f"  Nome Social:   {doc.get('social_name') or '-'}")
+        print(f"  CRM:           {doc.get('crm')}")
+        print(f"  UF:            {doc.get('state')}")
+        print(f"  Situação:      {doc.get('status', '-')}")
+        print(f"  Tipo Inscrição:{doc.get('registration_type', '-')}")
+        print(f"  Dt Inscrição:  {doc.get('registration_date', '-')}")
+        print(f"  Graduação:     {doc.get('graduation_institution', '-')}")
+        print(f"  Dt Graduação:  {doc.get('graduation_date', '-')}")
+
+        specialties = doc.get("specialties", [])
+        if specialties:
+            nomes = ", ".join(s.get("name", "") for s in specialties)
+            print(f"  Especialidades:{nomes}")
+        else:
+            print("  Especialidades:-")
+
+        print(f"  Telefone:      {doc.get('phone') or '-'}")
+        print(f"  Endereço:      {doc.get('address') or '-'}")
+        print(f"  Foto URL:      {doc.get('photo_url') or '-'}")
+        print("=" * 60)
+
+    except Exception as e:
+        print(f"\n❌ Erro: {e}")
+    finally:
+        await client.aclose()
+        await close_pool()
+
+
 # ── execute-state ──────────────────────────────────────────────
 
 
@@ -449,7 +550,9 @@ async def _run_execute_state(form: dict) -> None:
         )
         elapsed = time.time() - start
 
-        print(f"\n🎉 Sessão finalizada! {total_medicos} médicos processados em {int(elapsed // 60)}m{int(elapsed % 60)}s")
+        print(
+            f"\n🎉 Sessão finalizada! {total_medicos} médicos processados em {int(elapsed // 60)}m{int(elapsed % 60)}s"
+        )
 
     except KeyboardInterrupt:
         print("\n\n🛑 Interrompido pelo usuário.")

@@ -142,8 +142,8 @@ class Medico(BaseModel):
         foto_url = None
         if foto and foto.autorizacao_imagem == "S" and foto.hash:
             foto_url = (
-                f"https://portal.cfm.org.br/api_rest_php/api/v2/medicos/"
-                f"buscar_foto/?crm={foto.crm}&uf={foto.uf_crm}&hash={foto.hash}"
+                f"https://portal.cfm.org.br/wp-content/themes/portalcfm/"
+                f"assets/php/foto_medico.php?crm={foto.crm}&uf={foto.uf_crm}&hash={foto.hash}"
             )
 
         # Prioriza instituição nacional; fallback para estrangeira

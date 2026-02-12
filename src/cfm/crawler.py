@@ -73,6 +73,7 @@ def _build_search_payload(
     captcha_token: str,
     uf: str,
     municipio: str = "",
+    crm: str = "",
     page: int = 1,
     page_size: int = 100,
     tipo_inscricao: str = "",
@@ -86,7 +87,7 @@ def _build_search_payload(
             "medico": {
                 "nome": "",
                 "ufMedico": uf,
-                "crmMedico": "",
+                "crmMedico": crm,
                 "municipioMedico": municipio,
                 "tipoInscricaoMedico": tipo_inscricao,
                 "situacaoMedico": situacao,
@@ -196,6 +197,72 @@ async def fetch_medicos_page(
     medicos = adapter.validate_python(dados)
 
     return medicos, total_count
+
+
+async def fetch_medico_by_crm(
+    client: httpx.AsyncClient,
+    captcha_token: str,
+    crm: str,
+    uf: str,
+    db_pool: asyncpg.Pool,
+    request_timeout: int = 120,
+    fetch_foto: bool = True,
+) -> dict | None:
+    """Busca um médico específico por CRM/UF, exibe na tela e persiste no banco.
+
+    Args:
+        client: HTTP client configurado.
+        captcha_token: Token do reCAPTCHA.
+        crm: Número do CRM.
+        uf: UF do médico.
+        db_pool: Pool de conexões asyncpg.
+        request_timeout: Timeout por request em segundos.
+        fetch_foto: Se deve buscar foto/detalhes do médico.
+
+    Returns:
+        Dict com dados do médico formatado para o banco, ou None se não encontrado.
+    """
+    payload = _build_search_payload(
+        captcha_token=captcha_token,
+        uf=uf,
+        crm=crm,
+        page=1,
+        page_size=10,
+    )
+
+    try:
+        resp = await client.post(CFM_BUSCA_URL, json=payload, timeout=request_timeout)
+        data = resp.json()
+    except httpx.TimeoutException:
+        raise Exception(f"Timeout ao buscar CRM {crm}/{uf}")
+
+    if data.get("status") != "sucesso":
+        raise Exception(f"API retornou erro: {data}")
+
+    dados = data.get("dados", [])
+    if not dados:
+        return None
+
+    # Pega o primeiro resultado
+    adapter = TypeAdapter(list[MedicoRaw])
+    medicos = adapter.validate_python(dados)
+    raw = medicos[0]
+    raw_data = dados[0]
+
+    # Buscar foto se disponível
+    foto = None
+    if fetch_foto and raw.security_hash:
+        foto = await fetch_foto_medico(client, raw.nu_crm, raw.sg_uf, raw.security_hash)
+
+    # Formatar para banco
+    doc = _format_doctor_for_db(raw, raw_data, foto)
+
+    # Persistir
+    from .db.doctors import upsert_doctor
+
+    await upsert_doctor(db_pool, doc)
+
+    return doc
 
 
 async def fetch_foto_medico(
