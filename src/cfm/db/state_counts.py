@@ -53,3 +53,34 @@ async def get_db_counts_by_state(pool: asyncpg.Pool) -> dict[str, int]:
             "SELECT state, COUNT(*)::int AS total FROM doctors GROUP BY state"
         )
     return {row["state"]: row["total"] for row in rows}
+
+
+async def get_natural_counts_by_state(pool: asyncpg.Pool) -> dict[str, int]:
+    """Conta CRMs naturais distintos por estado.
+
+    Returns:
+        Dict mapeando UF -> quantidade de crm_natural únicos na tabela doctors.
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT state, COUNT(DISTINCT crm_natural)::int AS total "
+            "FROM doctors "
+            "WHERE crm_natural IS NOT NULL "
+            "GROUP BY state"
+        )
+    return {row["state"]: row["total"] for row in rows}
+
+
+async def get_total_distinct_natural_count(pool: asyncpg.Pool) -> int:
+    """Conta total de CRMs naturais distintos (médicos únicos, excluindo transferências).
+
+    Returns:
+        Número total de crm_natural distintos em toda a tabela doctors.
+    """
+    async with pool.acquire() as conn:
+        result = await conn.fetchval(
+            "SELECT COUNT(DISTINCT crm_natural)::int "
+            "FROM doctors "
+            "WHERE crm_natural IS NOT NULL"
+        )
+    return result or 0

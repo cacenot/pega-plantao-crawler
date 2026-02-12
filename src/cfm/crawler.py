@@ -307,6 +307,7 @@ async def _fetch_batch(
     request_timeout: int = 120,
     tipo_inscricao: str = "",
     situacao: str = "",
+    municipio: str = "",
 ) -> list[tuple[int, list[MedicoRaw], int]]:
     """Busca várias páginas em paralelo.
 
@@ -318,6 +319,7 @@ async def _fetch_batch(
             client=client,
             captcha_token=captcha_token,
             uf=uf,
+            municipio=municipio,
             current_page=p,
             page_size=page_size,
             request_timeout=request_timeout,
@@ -357,6 +359,7 @@ async def _fetch_batch(
                     client=client,
                     captcha_token=captcha_token,
                     uf=uf,
+                    municipio=municipio,
                     current_page=p,
                     page_size=page_size,
                     request_timeout=request_timeout,
@@ -390,6 +393,7 @@ async def crawl_state(
     batch_size: int = 5,
     tipo_inscricao: str = "",
     situacao: str = "",
+    municipio: str = "",
     start_page: int = 1,
 ) -> int:
     """Crawla todos os médicos de uma UF usando o plano de execução.
@@ -479,6 +483,7 @@ async def crawl_state(
                 request_timeout=request_timeout,
                 tipo_inscricao=tipo_inscricao,
                 situacao=situacao,
+                municipio=municipio,
             )
             batch_time = time.time() - batch_start
             batch_times.append(batch_time)
@@ -705,6 +710,7 @@ async def run_execution(
     request_timeout: int = 120,
     tipo_inscricao: str = "",
     situacao: str = "",
+    municipio: str = "",
     start_page: int = 1,
 ) -> int:
     """Executa um plano de execução completo.
@@ -746,6 +752,7 @@ async def run_execution(
                     batch_size=batch_size,
                     tipo_inscricao=tipo_inscricao,
                     situacao=situacao,
+                    municipio=municipio,
                     start_page=start_page,
                 )
                 total_medicos += count

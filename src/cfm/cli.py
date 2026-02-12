@@ -1,14 +1,15 @@
 """CLI do crawler CFM usando Typer.
 
 Subcomandos:
-    create   — Criar um plano de execução (form interativo)
-    execute  — Criar e executar de uma vez (form interativo)
-    run      — Iniciar/continuar uma execução
-    list     — Listar execuções ativas
-    show     — Visualizar detalhes de uma execução
-    cancel   — Cancelar uma execução
-    token    — Resolver reCAPTCHA manualmente e cachear token
-    count    — Totalizar médicos por estado (API vs banco)
+    create         — Criar um plano de execução (form interativo)
+    execute        — Criar e executar de uma vez (form interativo)
+    run            — Iniciar/continuar uma execução
+    list           — Listar execuções ativas
+    show           — Visualizar detalhes de uma execução
+    cancel         — Cancelar uma execução
+    token          — Resolver reCAPTCHA manualmente e cachear token
+    count          — Totalizar médicos por estado (API vs banco)
+    natural_count  — Contar CRMs naturais distintos por estado
 """
 
 import asyncio
@@ -178,6 +179,20 @@ def _interactive_form(title: str = "CFM - Configuração") -> dict:
         pointer="❯",
     ).execute()
 
+    # ── Filtro por Cidade ──────────────────────────────────────
+    filter_city = inquirer.confirm(
+        message="Filtrar por cidade?",
+        default=False,
+    ).execute()
+
+    city_code = ""
+    if filter_city:
+        city_code = inquirer.text(
+            message="Código da cidade (número):",
+            validate=lambda x: x.isdigit() or x == "",
+            invalid_message="Digite apenas números ou deixe vazio para cancelar.",
+        ).execute()
+
     # ── Página inicial ─────────────────────────────────────────
     start_page = int(
         inquirer.number(
@@ -202,6 +217,8 @@ def _interactive_form(title: str = "CFM - Configuração") -> dict:
         f"   Inscrição:  {TIPO_INSCRICAO_OPTIONS.get(tipo_inscricao, tipo_inscricao)}"
     )
     print(f"   Situação:   {SITUACAO_OPTIONS.get(situacao, situacao)}")
+    if city_code:
+        print(f"   Cidade:     {city_code}")
     if start_page > 1:
         print(f"   Pág. ini.:  {start_page}")
     print("-" * 60)
@@ -213,6 +230,7 @@ def _interactive_form(title: str = "CFM - Configuração") -> dict:
         "batch_size": batch_size,
         "tipo_inscricao": tipo_inscricao,
         "situacao": situacao,
+        "city_code": city_code,
         "start_page": start_page,
     }
 
@@ -235,6 +253,7 @@ def create() -> None:
         "states": form["states"],
         "tipo_inscricao": form["tipo_inscricao"],
         "situacao": form["situacao"],
+        "city_code": form["city_code"],
         "start_page": form["start_page"],
     }
     execution_id = asyncio.run(
@@ -271,6 +290,7 @@ def execute() -> None:
         "states": form["states"],
         "tipo_inscricao": form["tipo_inscricao"],
         "situacao": form["situacao"],
+        "city_code": form["city_code"],
         "start_page": form["start_page"],
     }
     execution_id = asyncio.run(
@@ -370,10 +390,13 @@ async def _run_execution(execution_id: int) -> None:
     exec_params = execution.get("params", {})
     tipo_inscricao = exec_params.get("tipo_inscricao", "")
     situacao = exec_params.get("situacao", "")
+    city_code = exec_params.get("city_code", "")
     tipo_label = TIPO_INSCRICAO_OPTIONS.get(tipo_inscricao, tipo_inscricao or "Todas")
     situacao_label = SITUACAO_OPTIONS.get(situacao, situacao or "Todas")
     print(f"📌 Inscrição: {tipo_label}")
     print(f"📌 Situação: {situacao_label}")
+    if city_code:
+        print(f"📌 Cidade: {city_code}")
     print(
         f"🔗 Database: {settings.database_url.split('@')[-1] if '@' in settings.database_url else settings.database_url}"
     )
@@ -404,6 +427,7 @@ async def _run_execution(execution_id: int) -> None:
             request_timeout=settings.request_timeout,
             tipo_inscricao=exec_params.get("tipo_inscricao", ""),
             situacao=exec_params.get("situacao", ""),
+            municipio=exec_params.get("city_code", ""),
             start_page=exec_params.get("start_page", 1),
         )
 
@@ -785,6 +809,61 @@ def _print_count_table(rows: list[dict], api_counts: dict[str, int]) -> None:
         print()
 
     print("  💾 Contagens salvas na tabela state_counts.")
+    print("=" * 70)
+
+
+# ── natural_count ──────────────────────────────────────────────
+
+
+@app.command()
+def natural_count() -> None:
+    """Contar CRMs naturais distintos por estado (excluindo repetições)."""
+    asyncio.run(_run_natural_count())
+
+
+async def _run_natural_count() -> None:
+    """Lógica async do subcomando natural_count."""
+    from .config import get_cfm_settings
+    from .db.connection import close_pool, create_pool
+    from .db.schema import ensure_tables
+    from .db.state_counts import (
+        get_db_counts_by_state,
+        get_total_distinct_natural_count,
+    )
+
+    settings = get_cfm_settings()
+    pool = await create_pool(settings.database_url)
+    await ensure_tables(pool)
+
+    print("\n" + "=" * 70)
+    print("📊 CFM - Contagem de Médicos Únicos (CRMs Naturais Distintos)")
+    print("=" * 70)
+
+    # Obter contagens do banco
+    total_registros = sum((await get_db_counts_by_state(pool)).values())
+    total_medicos_unicos = await get_total_distinct_natural_count(pool)
+    total_transferencias = total_registros - total_medicos_unicos
+
+    await close_pool()
+
+    if total_registros == 0:
+        print("\n⚠️  Nenhum médico encontrado no banco de dados.")
+        print("=" * 70)
+        return
+
+    # Exibir resumo
+    registros_str = f"{total_registros:,}".replace(",", ".")
+    unicos_str = f"{total_medicos_unicos:,}".replace(",", ".")
+    transferencias_str = f"{total_transferencias:,}".replace(",", ".")
+
+    print()
+    print(f"  📋 Total de Registros no Banco:  {registros_str}")
+    print(f"  👤 Médicos Únicos (crm_natural):  {unicos_str}")
+    print(f"  🔄 Registros de Transferência:    {transferencias_str}")
+    print()
+    print(
+        "  ℹ️  Médicos únicos são contados uma vez, mesmo tendo CRM em múltiplos estados."
+    )
     print("=" * 70)
 
 
