@@ -6,11 +6,27 @@ import math
 import time
 from pathlib import Path
 
+import asyncpg
 from playwright.async_api import Page, Response
 from pydantic import TypeAdapter
 
-from .cache import CaptchaCache
+from .db import captcha as captcha_db
 from .db.doctors import upsert_doctors_batch
+from .db.executions import (
+    check_execution_complete,
+    check_state_complete,
+    complete_execution_state,
+    fail_execution_state,
+    get_pending_pages,
+    get_pending_states,
+    initialize_pages,
+    mark_page_failed,
+    mark_pages_fetched_batch,
+    start_execution,
+    start_execution_state,
+    pause_execution,
+    update_execution_state,
+)
 from .models import Medico, MedicoFotoRaw, MedicoRaw, translate_keys_to_en
 from ..shared.specialty_parser import parse_specialties
 from ..shared.text_utils import title_case_br
@@ -82,32 +98,32 @@ def _build_search_payload(
     ]
 
 
-async def _get_captcha_token(cache: CaptchaCache) -> str:
-    """Obtém o token do captcha do cache Redis.
+async def _get_captcha_token(db_pool: asyncpg.Pool) -> str:
+    """Obtém o token do captcha do banco.
 
     Raises:
-        RuntimeError: Se não houver token válido no cache.
+        RuntimeError: Se não houver token válido.
     """
-    token = await cache.get_token()
+    token = await captcha_db.get_token(db_pool)
     if not token:
         raise RuntimeError(
             "❌ Token do captcha não encontrado ou expirado!\n"
             "   Execute primeiro: uv run cfm token"
         )
 
-    ttl = await cache._redis.ttl(cache._CAPTCHA_KEY)
-    print(f"✅ Token do captcha obtido do Redis (TTL restante: {ttl}s)")
+    ttl = await captcha_db.get_ttl(db_pool)
+    print(f"✅ Token do captcha obtido (TTL restante: {ttl}s)")
     return token
 
 
-async def _validate_captcha_token(cache: CaptchaCache) -> bool:
-    """Verifica se o token do captcha ainda é válido no cache."""
-    return await cache.is_valid()
+async def _validate_captcha_token(db_pool: asyncpg.Pool) -> bool:
+    """Verifica se o token do captcha ainda é válido."""
+    return await captcha_db.is_valid(db_pool)
 
 
-async def _get_captcha_ttl(cache: CaptchaCache) -> int:
+async def _get_captcha_ttl(db_pool: asyncpg.Pool) -> int:
     """Retorna o TTL restante do token do captcha em segundos."""
-    return await cache._redis.ttl(cache._CAPTCHA_KEY)
+    return await captcha_db.get_ttl(db_pool)
 
 
 async def _intercept_search_response(page: Page) -> dict:
@@ -360,57 +376,92 @@ async def _fetch_batch(
     return successful
 
 
-async def crawl_uf(
+async def crawl_state(
     page: Page,
     uf: str,
-    cache: CaptchaCache,
-    db_pool,
-    page_size: int = 200,
-    delay: float = 2.0,
+    execution_state_id: int,
+    db_pool: asyncpg.Pool,
+    page_size: int = 1000,
+    delay: float = 0.8,
     fetch_fotos: bool = True,
     max_results: int = 0,
-    start_page: int = 1,
     request_timeout: int = 120,
     batch_size: int = 5,
 ) -> int:
-    """Crawla todos os médicos de uma UF, paginando até o fim.
+    """Crawla todos os médicos de uma UF usando o plano de execução.
+
+    Usa a tabela crawl_pages para saber exatamente quais páginas faltam.
+    Ao descobrir total_pages, pré-cria todas como 'pending'.
+    Retoma de onde parou buscando apenas páginas pending/failed.
 
     Returns:
-        Total de médicos processados para esta UF.
+        Total de médicos processados para esta UF nesta sessão.
     """
     print(f"\n{'=' * 60}")
     print(f"🏥 Iniciando crawl da UF: {uf}")
-    if start_page > 1:
-        print(f"🔄 Retomando a partir da página {start_page}")
     print(f"⚡ Batch size: {batch_size} | Timeout: {request_timeout}s")
     print(f"{'=' * 60}")
 
-    captcha_token = await _get_captcha_token(cache)
+    await start_execution_state(db_pool, execution_state_id)
 
-    medicos_anteriores = (start_page - 1) * page_size
+    captcha_token = await _get_captcha_token(db_pool)
+
     total_medicos = 0
-    current_page = start_page
-    total_pages = None
     total_count = 0
+    total_pages = None
     retries = 0
     max_retries = 3
+    consecutive_empty_batches = 0
+    max_empty_batches = 2  # Pausa após N batches consecutivos com 0 médicos
 
     batch_times: list[float] = []
     total_start_time = time.time()
 
+    # Carregar total_pages/total_records do banco (para retomada)
+    state_row = await db_pool.fetchrow(
+        "SELECT total_pages, total_records FROM crawl_execution_states WHERE id = $1",
+        execution_state_id,
+    )
+    if state_row and state_row["total_pages"]:
+        total_pages = state_row["total_pages"]
+        total_count = state_row["total_records"] or 0
+
+    # Busca a primeira página para descobrir total_count e total_pages
+    pending = await get_pending_pages(db_pool, execution_state_id, limit=1)
+
+    # Se não há páginas pendentes no banco, precisamos fazer a descoberta inicial
+    first_page = pending[0] if pending else 1
+    discovery_needed = not pending  # Se não há nenhuma página, precisa descobrir
+
+    if not discovery_needed:
+        # Verifica se já inicializou (tem páginas no banco)
+        all_pending = await get_pending_pages(db_pool, execution_state_id)
+        if all_pending:
+            print(f"🔄 Retomando: {len(all_pending)} páginas pendentes")
+        else:
+            # Todas fetched — verificar completude
+            if await check_state_complete(db_pool, execution_state_id):
+                print(f"✅ UF {uf} já está completa.")
+                return 0
+
     while True:
-        if not await _validate_captcha_token(cache):
+        if not await _validate_captcha_token(db_pool):
             print("❌ Token do captcha expirou! Execute: uv run cfm token")
-            await cache.mark_failed(uf)
+            await fail_execution_state(db_pool, execution_state_id)
             raise RuntimeError("Token do captcha expirado durante o crawl.")
 
-        if total_pages is not None:
-            remaining_pages = total_pages - current_page + 1
-            n_pages = min(batch_size, remaining_pages)
-        else:
-            n_pages = batch_size
+        # Busca páginas pendentes do banco
+        pending_pages = await get_pending_pages(
+            db_pool, execution_state_id, limit=batch_size
+        )
 
-        pages_to_fetch = list(range(current_page, current_page + n_pages))
+        if not pending_pages:
+            # Sem mais páginas pendentes
+            if total_pages is None:
+                # Primeira execução — busca página 1 para descobrir total
+                pending_pages = [1]
+            else:
+                break
 
         batch_start = time.time()
 
@@ -419,7 +470,7 @@ async def crawl_uf(
                 page=page,
                 captcha_token=captcha_token,
                 uf=uf,
-                pages=pages_to_fetch,
+                pages=pending_pages,
                 page_size=page_size,
                 request_timeout=request_timeout,
             )
@@ -431,13 +482,13 @@ async def crawl_uf(
             print(f"⚠️ Erro no batch (tentativa {retries}/{max_retries}): {e}")
 
             if retries >= max_retries:
-                if await _validate_captcha_token(cache):
-                    captcha_token = await _get_captcha_token(cache)
+                if await _validate_captcha_token(db_pool):
+                    captcha_token = await _get_captcha_token(db_pool)
                     retries = 0
                     continue
                 else:
                     print("❌ Token expirado e máximo de retries atingido.")
-                    await cache.mark_failed(uf)
+                    await fail_execution_state(db_pool, execution_state_id)
                     raise RuntimeError(
                         f"Falha após {max_retries} tentativas para UF {uf}. "
                         "Execute: uv run cfm token"
@@ -449,14 +500,14 @@ async def crawl_uf(
         if not results:
             retries += 1
             if retries >= max_retries:
-                if await _validate_captcha_token(cache):
-                    captcha_token = await _get_captcha_token(cache)
+                if await _validate_captcha_token(db_pool):
+                    captcha_token = await _get_captcha_token(db_pool)
                     retries = 0
                     continue
                 else:
-                    await cache.mark_failed(uf)
+                    await fail_execution_state(db_pool, execution_state_id)
                     raise RuntimeError(
-                        f"Todas as {len(pages_to_fetch)} requests falharam para UF {uf}."
+                        f"Todas as {len(pending_pages)} requests falharam para UF {uf}."
                     )
             await asyncio.sleep(delay)
             continue
@@ -464,37 +515,99 @@ async def crawl_uf(
         results.sort(key=lambda r: r[0])
 
         batch_medicos: list[dict] = []
-        last_page_in_batch = current_page
-        finished = False
+        fetched_page_records: list[tuple[int, int]] = []  # (page_number, count)
+        blocked_page_numbers: list[
+            int
+        ] = []  # páginas com 0 médicos (servidor bloqueou)
+        failed_page_numbers: list[int] = set(pending_pages) - {r[0] for r in results}
 
         for page_num, raw_medicos, page_total_count in results:
-            if not raw_medicos:
-                finished = True
-                break
+            if page_total_count > 0:
+                total_count = page_total_count
+                new_total_pages = math.ceil(total_count / page_size)
 
-            total_count = page_total_count
-            total_pages = math.ceil(total_count / page_size) if total_count > 0 else 1
-            last_page_in_batch = page_num
+                if total_pages is None or new_total_pages != total_pages:
+                    total_pages = new_total_pages
+                    # Pré-criar/atualizar páginas no banco
+                    inserted = await initialize_pages(
+                        db_pool, execution_state_id, total_pages
+                    )
+                    await update_execution_state(
+                        db_pool,
+                        execution_state_id,
+                        total_pages=total_pages,
+                        total_records=total_count,
+                    )
+                    if inserted > 0:
+                        print(
+                            f"📋 Total: {total_count} médicos em {total_pages} páginas "
+                            f"({inserted} novas páginas criadas)"
+                        )
 
-            for raw in raw_medicos:
-                raw_data = raw.model_dump(mode="json", by_alias=True)
-                doc = _format_doctor_for_db(raw, raw_data=raw_data, foto=None)
-                batch_medicos.append(doc)
+            record_count = len(raw_medicos) if raw_medicos else 0
 
-            if len(raw_medicos) < page_size:
-                finished = True
-                break
+            # Detectar bloqueio do servidor: página retorna 0 médicos
+            # mas sabemos que deveria ter (total_count já conhecido)
+            if record_count == 0 and total_count > 0:
+                blocked_page_numbers.append(page_num)
+            else:
+                fetched_page_records.append((page_num, record_count))
 
-        total_acumulado = medicos_anteriores + total_medicos + len(batch_medicos)
-        pages_in_batch = last_page_in_batch - current_page + 1
-        successful_pages = len(results)
-        failed_pages_count = len(pages_to_fetch) - successful_pages
+            if raw_medicos:
+                for raw in raw_medicos:
+                    raw_data = raw.model_dump(mode="json", by_alias=True)
+                    doc = _format_doctor_for_db(raw, raw_data=raw_data, foto=None)
+                    batch_medicos.append(doc)
+
+        # Marcar páginas no banco
+        if fetched_page_records:
+            await mark_pages_fetched_batch(
+                db_pool, execution_state_id, fetched_page_records
+            )
+        for fp in failed_page_numbers:
+            await mark_page_failed(
+                db_pool, execution_state_id, fp, "Sem resultado no batch"
+            )
+        for bp in blocked_page_numbers:
+            await mark_page_failed(
+                db_pool,
+                execution_state_id,
+                bp,
+                "Servidor retornou 0 médicos (possível bloqueio)",
+            )
+
+        # Detectar bloqueio consecutivo do servidor
+        if batch_medicos:
+            consecutive_empty_batches = 0
+        elif total_count > 0:
+            # Batch inteiro retornou 0 médicos — possível bloqueio
+            consecutive_empty_batches += 1
+            if consecutive_empty_batches >= max_empty_batches:
+                print(
+                    f"\n🚫 Servidor bloqueou! {consecutive_empty_batches} batches "
+                    f"consecutivos retornaram 0 médicos."
+                )
+                print(
+                    f"   {len(blocked_page_numbers)} páginas marcadas como falha para retry."
+                )
+                print(f"   Pausando execução. Resolva novo captcha e retome:")
+                print(f"   uv run cfm token && uv run cfm run <ID>")
+                await fail_execution_state(db_pool, execution_state_id)
+                raise RuntimeError(
+                    "Servidor bloqueou a requisição (0 médicos retornados). "
+                    "Resolva novo captcha: uv run cfm token"
+                )
+
+        # Calcular progresso
+        remaining_pages = await get_pending_pages(db_pool, execution_state_id)
+        remaining_count = len(remaining_pages)
+
+        fetched_count = (total_pages or 0) - remaining_count if total_pages else 0
+        percentage = round(fetched_count / total_pages * 100, 1) if total_pages else 0
 
         avg_batch_time = sum(batch_times) / len(batch_times) if batch_times else 0
-        if total_pages and total_pages > last_page_in_batch:
-            batches_remaining = math.ceil(
-                (total_pages - last_page_in_batch) / batch_size
-            )
+        if remaining_count > 0:
+            batches_remaining = math.ceil(remaining_count / batch_size)
             eta_seconds = batches_remaining * (avg_batch_time + delay)
             eta_minutes = int(eta_seconds / 60)
         else:
@@ -509,20 +622,25 @@ async def crawl_uf(
             eta_info = f" | ETA: ~{eta_minutes}m"
 
         ttl_info = ""
-        if current_page == start_page or last_page_in_batch % 20 == 0:
-            ttl = await _get_captcha_ttl(cache)
+        if fetched_count <= batch_size or fetched_count % 20 == 0:
+            ttl = await _get_captcha_ttl(db_pool)
             if ttl > 0:
                 ttl_info = f" | TTL: {ttl}s"
                 if ttl < 120:
                     ttl_info += " ⚠️"
 
-        fail_info = f" ({failed_pages_count} falhas)" if failed_pages_count > 0 else ""
+        page_range = (
+            f"{min(pending_pages)}-{max(pending_pages)}" if pending_pages else "?"
+        )
+        successful = len(results)
+        fail_count = len(failed_page_numbers)
+        fail_info = f" ({fail_count} falhas)" if fail_count > 0 else ""
 
         print(
-            f"📡 Páginas {current_page}-{last_page_in_batch}"
+            f"📡 Páginas {page_range}"
             f"/{total_pages or '?'}: {len(batch_medicos)} médicos "
-            f"(parcial: {total_acumulado}/{total_count}) | "
-            f"{batch_time:.2f}s ({successful_pages}pg){fail_info}{eta_info}{ttl_info}"
+            f"({percentage}%) | "
+            f"{batch_time:.2f}s ({successful}pg){fail_info}{eta_info}{ttl_info}"
         )
 
         if batch_medicos:
@@ -535,44 +653,115 @@ async def crawl_uf(
 
             total_medicos += len(batch_medicos)
 
-        if total_pages:
-            await cache.store_progress(
-                uf=uf,
-                last_page=last_page_in_batch,
-                total_pages=total_pages,
-                total_records=total_count,
-                status="running",
-            )
-
         if max_results > 0 and total_medicos >= max_results:
             print(f"🛑 Limite de teste atingido: {total_medicos}/{max_results}")
             break
 
-        if finished or total_acumulado >= total_count:
-            print(f"✅ {total_acumulado}/{total_count} médicos coletados para {uf}.")
+        # Verificar se terminou
+        if remaining_count == 0:
             break
 
-        current_page = last_page_in_batch + 1
         await asyncio.sleep(delay)
 
-    await cache.mark_complete(uf)
-    total_final = medicos_anteriores + total_medicos
+    # Verificar completude do estado
+    is_complete = await check_state_complete(db_pool, execution_state_id)
 
     total_time = time.time() - total_start_time
     total_minutes = int(total_time / 60)
     total_seconds = int(total_time % 60)
-    pages_processed = (last_page_in_batch - start_page + 1) if results else 0
 
+    status_icon = "✅" if is_complete else "⏸️"
     print(f"\n{'=' * 60}")
     print(
-        f"💾 {total_medicos} médicos processados nesta sessão ({total_final} total) de {uf} persistidos no PostgreSQL."
+        f"{status_icon} {total_medicos} médicos processados nesta sessão para UF {uf}."
     )
     print(f"⏱️  Tempo total: {total_minutes}m {total_seconds}s")
-    print(f"📄 Páginas processadas: {pages_processed}")
     if batch_times:
         avg_time = sum(batch_times) / len(batch_times)
         print(f"⚡ Tempo médio por batch ({batch_size}pg): {avg_time:.2f}s")
     print(f"{'=' * 60}")
+
+    return total_medicos
+
+
+async def run_execution(
+    page: Page,
+    execution_id: int,
+    db_pool: asyncpg.Pool,
+    page_size: int = 1000,
+    batch_size: int = 5,
+    delay: float = 0.8,
+    fetch_fotos: bool = True,
+    max_results: int = 0,
+    request_timeout: int = 120,
+) -> int:
+    """Executa um plano de execução completo.
+
+    Itera sobre os estados pendentes da execução, chamando crawl_state para cada.
+    Trata interrupções e atualiza status.
+
+    Returns:
+        Total de médicos processados na sessão.
+    """
+    await start_execution(db_pool, execution_id)
+    total_medicos = 0
+
+    try:
+        pending_states = await get_pending_states(db_pool, execution_id)
+
+        if not pending_states:
+            print("ℹ️  Todos os estados já foram processados.")
+            await check_execution_complete(db_pool, execution_id)
+            return 0
+
+        print(f"📋 Estados pendentes: {', '.join(s['state'] for s in pending_states)}")
+
+        for state_record in pending_states:
+            uf = state_record["state"]
+            state_id = state_record["id"]
+
+            try:
+                count = await crawl_state(
+                    page=page,
+                    uf=uf,
+                    execution_state_id=state_id,
+                    db_pool=db_pool,
+                    page_size=page_size,
+                    delay=delay,
+                    fetch_fotos=fetch_fotos,
+                    max_results=max_results,
+                    request_timeout=request_timeout,
+                    batch_size=batch_size,
+                )
+                total_medicos += count
+
+            except RuntimeError as e:
+                if "captcha" in str(e).lower():
+                    print(f"\n❌ Token do captcha expirou durante o crawl de {uf}.")
+                    print("   Execute: uv run cfm token")
+                    await pause_execution(db_pool, execution_id)
+                    raise
+                print(f"❌ Erro ao processar UF {uf}: {e}")
+                continue
+            except Exception as e:
+                print(f"❌ Erro ao processar UF {uf}: {e}")
+                await fail_execution_state(db_pool, state_id)
+                continue
+
+        # Verificar se completou tudo
+        is_complete = await check_execution_complete(db_pool, execution_id)
+        if is_complete:
+            print(f"\n🎉 Execução #{execution_id} concluída com sucesso!")
+        else:
+            print(
+                f"\n⏸️ Execução #{execution_id} pausada. Use 'cfm run {execution_id}' para continuar."
+            )
+            await pause_execution(db_pool, execution_id)
+
+    except KeyboardInterrupt:
+        print(f"\n\n🛑 Interrompido pelo usuário. Execução #{execution_id} pausada.")
+        await pause_execution(db_pool, execution_id)
+        raise
 
     return total_medicos
 

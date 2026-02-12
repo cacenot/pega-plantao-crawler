@@ -41,8 +41,7 @@ class CfmSettings(BaseSettings):
     # PostgreSQL
     database_url: str = "postgresql://postgres:postgres@localhost:5432/qp_crawler"
 
-    # Redis
-    redis_url: str = "redis://localhost:6379/0"
+    # Captcha
     captcha_ttl: int = 1800  # TTL do token do captcha em segundos
 
 
