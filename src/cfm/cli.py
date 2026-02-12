@@ -2,11 +2,13 @@
 
 Subcomandos:
     create   — Criar um plano de execução (form interativo)
+    execute  — Criar e executar de uma vez (form interativo)
     run      — Iniciar/continuar uma execução
     list     — Listar execuções ativas
     show     — Visualizar detalhes de uma execução
     cancel   — Cancelar uma execução
     token    — Resolver reCAPTCHA manualmente e cachear token
+    count    — Totalizar médicos por estado (API vs banco)
 """
 
 import asyncio
@@ -58,13 +60,19 @@ EXECUTION_TYPES = {
     "company": "Empresas Médicas",
 }
 
+# Re-exporta opções de filtro para uso no CLI
+from .models import SITUACAO_OPTIONS, TIPO_INSCRICAO_OPTIONS
 
-# ── create ─────────────────────────────────────────────────────
+
+# ── Formulário interativo compartilhado ────────────────────────
 
 
-@app.command()
-def create() -> None:
-    """Criar um novo plano de execução (form interativo)."""
+def _interactive_form(title: str = "CFM - Configuração") -> dict:
+    """Formulário interativo para configurar execução.
+
+    Retorna dict com: exec_type, states, page_size, batch_size,
+    tipo_inscricao, situacao, start_page.
+    """
     from InquirerPy import inquirer
     from InquirerPy.base.control import Choice
     from InquirerPy.separator import Separator
@@ -74,7 +82,7 @@ def create() -> None:
     settings = get_cfm_settings()
 
     print("\n" + "=" * 60)
-    print("📋 CFM - Criar Plano de Execução")
+    print(f"📋 {title}")
     print("=" * 60)
 
     # ── Tipo (radio) ───────────────────────────────────────────
@@ -94,7 +102,6 @@ def create() -> None:
         raise typer.Exit()
 
     # ── Estados (checkbox) ─────────────────────────────────────
-    # Agrupa por região para organizar a lista
     regions = {
         "Norte": ["AC", "AM", "AP", "PA", "RO", "RR", "TO"],
         "Nordeste": ["AL", "BA", "CE", "MA", "PB", "PE", "PI", "RN", "SE"],
@@ -136,7 +143,7 @@ def create() -> None:
             message="Page size (registros por página):",
             default=settings.page_size,
             min_allowed=1,
-            max_allowed=10000,
+            max_allowed=25000,
         ).execute()
     )
 
@@ -150,32 +157,134 @@ def create() -> None:
         ).execute()
     )
 
-    # ── Confirmação ────────────────────────────────────────────
+    # ── Tipo de Inscrição ──────────────────────────────────
+    tipo_inscricao = inquirer.select(
+        message="Tipo de Inscrição:",
+        choices=[
+            Choice(value=code, name=label)
+            for code, label in TIPO_INSCRICAO_OPTIONS.items()
+        ],
+        default="",
+        pointer="❯",
+    ).execute()
+
+    # ── Situação ────────────────────────────────────────────
+    situacao = inquirer.select(
+        message="Situação:",
+        choices=[
+            Choice(value=code, name=label) for code, label in SITUACAO_OPTIONS.items()
+        ],
+        default="",
+        pointer="❯",
+    ).execute()
+
+    # ── Página inicial ─────────────────────────────────────────
+    start_page = int(
+        inquirer.number(
+            message="Página inicial (começar a partir de qual página):",
+            default=1,
+            min_allowed=1,
+        ).execute()
+    )
+
+    # ── Resumo ─────────────────────────────────────────────────
     states_display = ", ".join(states[:6])
     if len(states) > 6:
         states_display += f" +{len(states) - 6}"
 
     print("\n" + "-" * 60)
-    print("📋 Resumo do plano de execução:")
+    print("📋 Resumo:")
     print(f"   Tipo:       {EXECUTION_TYPES[exec_type]} ({exec_type})")
     print(f"   Estados:    {states_display} ({len(states)} UFs)")
     print(f"   Page size:  {page_size}")
     print(f"   Batch size: {batch_size}")
+    print(
+        f"   Inscrição:  {TIPO_INSCRICAO_OPTIONS.get(tipo_inscricao, tipo_inscricao)}"
+    )
+    print(f"   Situação:   {SITUACAO_OPTIONS.get(situacao, situacao)}")
+    if start_page > 1:
+        print(f"   Pág. ini.:  {start_page}")
     print("-" * 60)
+
+    return {
+        "exec_type": exec_type,
+        "states": states,
+        "page_size": page_size,
+        "batch_size": batch_size,
+        "tipo_inscricao": tipo_inscricao,
+        "situacao": situacao,
+        "start_page": start_page,
+    }
+
+
+# ── create ─────────────────────────────────────────────────────
+
+
+@app.command()
+def create() -> None:
+    """Criar um novo plano de execução (form interativo)."""
+    from InquirerPy import inquirer
+
+    form = _interactive_form(title="CFM - Criar Plano de Execução")
 
     if not inquirer.confirm(message="Confirmar criação?", default=True).execute():
         typer.echo("❌ Cancelado.")
         raise typer.Exit()
 
-    params = {"states": states}
+    params = {
+        "states": form["states"],
+        "tipo_inscricao": form["tipo_inscricao"],
+        "situacao": form["situacao"],
+        "start_page": form["start_page"],
+    }
     execution_id = asyncio.run(
-        _create_execution(exec_type, page_size, batch_size, params, states)
+        _create_execution(
+            form["exec_type"],
+            form["page_size"],
+            form["batch_size"],
+            params,
+            form["states"],
+        )
     )
 
     print(f"\n✅ Execução #{execution_id} criada com sucesso!")
 
     if inquirer.confirm(message="🚀 Iniciar execução agora?", default=True).execute():
         asyncio.run(_run_execution(execution_id))
+
+
+# ── execute ────────────────────────────────────────────────────
+
+
+@app.command()
+def execute() -> None:
+    """Criar e executar de uma vez (form interativo, sem etapa separada)."""
+    from InquirerPy import inquirer
+
+    form = _interactive_form(title="CFM - Executar Crawler")
+
+    if not inquirer.confirm(message="🚀 Iniciar execução?", default=True).execute():
+        typer.echo("❌ Cancelado.")
+        raise typer.Exit()
+
+    params = {
+        "states": form["states"],
+        "tipo_inscricao": form["tipo_inscricao"],
+        "situacao": form["situacao"],
+        "start_page": form["start_page"],
+    }
+    execution_id = asyncio.run(
+        _create_execution(
+            form["exec_type"],
+            form["page_size"],
+            form["batch_size"],
+            params,
+            form["states"],
+        )
+    )
+
+    print(f"\n✅ Execução #{execution_id} criada. Iniciando...")
+    asyncio.run(_run_execution(execution_id))
 
 
 async def _create_execution(
@@ -224,10 +333,8 @@ def run(
 
 async def _run_execution(execution_id: int) -> None:
     """Lógica async do subcomando run."""
-    from playwright.async_api import async_playwright
-
     from .config import get_cfm_settings
-    from .crawler import CFM_PAGE_URL, run_execution
+    from .crawler import create_http_client, run_execution
     from .db import captcha as captcha_db
     from .db.connection import close_pool, create_pool
     from .db.executions import get_execution
@@ -259,6 +366,14 @@ async def _run_execution(execution_id: int) -> None:
     print(f"📋 UFs: {', '.join(states)}")
     print(f"📦 Page size: {execution['page_size']}")
     print(f"⚡ Batch size: {execution['batch_size']}")
+    # Exibir filtros de busca
+    exec_params = execution.get("params", {})
+    tipo_inscricao = exec_params.get("tipo_inscricao", "")
+    situacao = exec_params.get("situacao", "")
+    tipo_label = TIPO_INSCRICAO_OPTIONS.get(tipo_inscricao, tipo_inscricao or "Todas")
+    situacao_label = SITUACAO_OPTIONS.get(situacao, situacao or "Todas")
+    print(f"📌 Inscrição: {tipo_label}")
+    print(f"📌 Situação: {situacao_label}")
     print(
         f"🔗 Database: {settings.database_url.split('@')[-1] if '@' in settings.database_url else settings.database_url}"
     )
@@ -274,41 +389,11 @@ async def _run_execution(execution_id: int) -> None:
     ttl = await captcha_db.get_ttl(pool)
     print(f"\n✅ Token de captcha encontrado (TTL: {ttl}s)")
 
-    # Abrir navegador
-    playwright = await async_playwright().start()
-
-    browser = await playwright.chromium.launch(
-        headless=settings.headless,
-        channel="chrome",
-        args=["--disable-blink-features=AutomationControlled"],
-    )
-    context = await browser.new_context(
-        user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/131.0.0.0 Safari/537.36"
-        ),
-        viewport={"width": 1280, "height": 720},
-        locale="pt-BR",
-    )
-
-    await context.add_init_script("""
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    """)
-
-    page = await context.new_page()
-
-    print("\n🌐 Abrindo portal do CFM no navegador...")
-    await page.goto(CFM_PAGE_URL, wait_until="domcontentloaded", timeout=60000)
-
-    try:
-        await page.wait_for_selector("iframe[src*='recaptcha']", timeout=15000)
-    except Exception:
-        pass
+    client = create_http_client(timeout=settings.request_timeout)
 
     try:
         total_medicos = await run_execution(
-            page=page,
+            client=client,
             execution_id=execution_id,
             db_pool=pool,
             page_size=execution["page_size"],
@@ -317,6 +402,9 @@ async def _run_execution(execution_id: int) -> None:
             fetch_fotos=settings.fetch_fotos,
             max_results=settings.max_results,
             request_timeout=settings.request_timeout,
+            tipo_inscricao=exec_params.get("tipo_inscricao", ""),
+            situacao=exec_params.get("situacao", ""),
+            start_page=exec_params.get("start_page", 1),
         )
 
         print("\n" + "=" * 60)
@@ -333,8 +421,7 @@ async def _run_execution(execution_id: int) -> None:
         else:
             print(f"\n❌ Erro: {e}")
     finally:
-        await browser.close()
-        await playwright.stop()
+        await client.aclose()
         await close_pool()
 
 
@@ -397,6 +484,25 @@ async def _list_executions() -> None:
         print(f"         │  UFs: {states_str}")
         print(f"         │  Page: {ex['page_size']}  Batch: {ex['batch_size']}")
 
+        # Mostrar filtros se não forem o padrão (Todas)
+        list_params = ex.get("params", {})
+        list_tipo = list_params.get("tipo_inscricao", "")
+        list_situacao = list_params.get("situacao", "")
+        filters = []
+        if list_tipo:
+            filters.append(
+                f"Inscrição: {TIPO_INSCRICAO_OPTIONS.get(list_tipo, list_tipo)}"
+            )
+        if list_situacao:
+            filters.append(
+                f"Situação: {SITUACAO_OPTIONS.get(list_situacao, list_situacao)}"
+            )
+        list_start_page = list_params.get("start_page", 1)
+        if list_start_page > 1:
+            filters.append(f"Pág. ini.: {list_start_page}")
+        if filters:
+            print(f"         │  {' | '.join(filters)}")
+
     print("\n" + "-" * 70)
     print("  Comandos: cfm show <id> │ cfm run <id> │ cfm cancel <id>")
     print("=" * 70)
@@ -456,6 +562,20 @@ async def _show_execution(execution_id: int) -> None:
     print(f"  Page size:  {ex['page_size']}")
     print(f"  Batch size: {ex['batch_size']}")
 
+    # Filtros de busca
+    show_params = ex.get("params", {})
+    show_tipo = show_params.get("tipo_inscricao", "")
+    show_situacao = show_params.get("situacao", "")
+    print(
+        f"  Inscrição:  {TIPO_INSCRICAO_OPTIONS.get(show_tipo, show_tipo or 'Todas')}"
+    )
+    print(
+        f"  Situação:   {SITUACAO_OPTIONS.get(show_situacao, show_situacao or 'Todas')}"
+    )
+    show_start_page = show_params.get("start_page", 1)
+    if show_start_page > 1:
+        print(f"  Pág. ini.:  {show_start_page}")
+
     if ex["created_at"]:
         print(f"  Criado em:  {ex['created_at'].strftime('%d/%m/%Y %H:%M:%S')}")
     if ex["started_at"]:
@@ -504,6 +624,168 @@ async def _show_execution(execution_id: int) -> None:
         )
 
     print("\n" + "=" * 60)
+
+
+# ── count ──────────────────────────────────────────────────────
+
+
+@app.command()
+def count() -> None:
+    """Totalizar médicos por estado: compara total da API com o banco local."""
+    asyncio.run(_run_count())
+
+
+async def _run_count() -> None:
+    """Lógica async do subcomando count."""
+    import time
+
+    from .config import get_cfm_settings
+    from .crawler import UFS, fetch_all_state_counts
+    from .db import captcha as captcha_db
+    from .db.connection import close_pool, create_pool
+    from .db.schema import ensure_tables
+    from .db.state_counts import (
+        get_db_counts_by_state,
+        upsert_state_counts_batch,
+    )
+
+    settings = get_cfm_settings()
+    pool = await create_pool(settings.database_url)
+    await ensure_tables(pool)
+
+    # Validar captcha
+    if not await captcha_db.is_valid(pool):
+        print("\n❌ Token de captcha não encontrado ou expirado!")
+        print("   Execute primeiro: uv run cfm token")
+        await close_pool()
+        return
+
+    ttl = await captcha_db.get_ttl(pool)
+    captcha_token = await captcha_db.get_token(pool)
+
+    print("\n" + "=" * 70)
+    print("📊 CFM - Contagem de Médicos por Estado")
+    print("=" * 70)
+    print(f"✅ Token de captcha encontrado (TTL: {ttl}s)")
+
+    try:
+        print(f"🔍 Consultando {len(UFS)} estados em paralelo...")
+        start = time.time()
+        api_counts = await fetch_all_state_counts(captcha_token)
+        elapsed = time.time() - start
+        print(f"✅ Consultas finalizadas em {elapsed:.1f}s")
+    except Exception as e:
+        print(f"\n❌ Erro ao consultar API: {e}")
+        await close_pool()
+        return
+
+    # Obter contagens do banco
+    db_counts = await get_db_counts_by_state(pool)
+
+    # Montar tabela de resultados
+    rows: list[dict] = []
+    for uf in sorted(UFS):
+        api_total = api_counts.get(uf, 0)
+        if api_total < 0:
+            api_total = 0  # Erro na consulta
+        db_total = db_counts.get(uf, 0)
+        missing = max(api_total - db_total, 0)
+        rows.append(
+            {
+                "state": uf,
+                "api_total": api_total,
+                "db_total": db_total,
+                "missing": missing,
+            }
+        )
+
+    # Persistir contagens
+    await upsert_state_counts_batch(pool, rows)
+    await close_pool()
+
+    # Exibir tabela
+    _print_count_table(rows, api_counts)
+
+
+def _print_count_table(rows: list[dict], api_counts: dict[str, int]) -> None:
+    """Exibe tabela formatada com totais por estado."""
+    header = (
+        f"  {'UF':<4} │ {'Nome':<22} │ {'API Total':>10} │ "
+        f"{'DB Total':>10} │ {'Faltantes':>10} │ {'%':>7}"
+    )
+    sep = (
+        "  "
+        + "─" * 4
+        + "┼"
+        + "─" * 24
+        + "┼"
+        + "─" * 12
+        + "┼"
+        + "─" * 12
+        + "┼"
+        + "─" * 12
+        + "┼"
+        + "─" * 9
+    )
+
+    print("\n" + header)
+    print(sep)
+
+    sum_api = 0
+    sum_db = 0
+    sum_missing = 0
+    errors: list[str] = []
+
+    for r in rows:
+        uf = r["state"]
+        api_total = r["api_total"]
+        db_total = r["db_total"]
+        missing = r["missing"]
+        uf_name = UFS_MAP.get(uf, uf)
+
+        had_error = api_counts.get(uf, 0) < 0
+
+        if had_error:
+            pct_str = "ERRO"
+            api_str = "?"
+            missing_str = "?"
+            errors.append(uf)
+        else:
+            pct = round(db_total / api_total * 100, 1) if api_total > 0 else 0.0
+            pct_str = f"{pct}%"
+            api_str = f"{api_total:,}".replace(",", ".")
+            missing_str = f"{missing:,}".replace(",", ".")
+
+        db_str = f"{db_total:,}".replace(",", ".")
+
+        sum_api += api_total
+        sum_db += db_total
+        sum_missing += missing
+
+        print(
+            f"  {uf:<4} │ {uf_name:<22} │ {api_str:>10} │ "
+            f"{db_str:>10} │ {missing_str:>10} │ {pct_str:>7}"
+        )
+
+    print(sep)
+
+    total_pct = round(sum_db / sum_api * 100, 1) if sum_api > 0 else 0.0
+    sum_api_str = f"{sum_api:,}".replace(",", ".")
+    sum_db_str = f"{sum_db:,}".replace(",", ".")
+    sum_missing_str = f"{sum_missing:,}".replace(",", ".")
+
+    print(
+        f"  {'TOTAL':<4} │ {'':<22} │ {sum_api_str:>10} │ "
+        f"{sum_db_str:>10} │ {sum_missing_str:>10} │ {total_pct:>6}%"
+    )
+    print()
+
+    if errors:
+        print(f"  ⚠️  Erro ao consultar: {', '.join(errors)}")
+        print()
+
+    print("  💾 Contagens salvas na tabela state_counts.")
+    print("=" * 70)
 
 
 # ── cancel ─────────────────────────────────────────────────────

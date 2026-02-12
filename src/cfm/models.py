@@ -10,6 +10,24 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger(__name__)
 
 
+# ── Opções de filtro da API ────────────────────────────────────
+
+TIPO_INSCRICAO_OPTIONS: dict[str, str] = {
+    "": "Todas",
+    "P": "Principal",
+    "S": "Secundária",
+    "V": "Provisória",
+    "R": "Provisória Secundária",
+    "E": "Estudante Médico Estrangeiro",
+}
+
+SITUACAO_OPTIONS: dict[str, str] = {
+    "": "Todas",
+    "A": "Ativo",
+    "I": "Inativo",
+}
+
+
 # ── Modelos Raw (API) ─────────────────────────────────────────
 
 

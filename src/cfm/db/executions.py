@@ -281,27 +281,35 @@ async def initialize_pages(
     pool: asyncpg.Pool,
     execution_state_id: int,
     total_pages: int,
+    start_page: int = 1,
 ) -> int:
-    """Pré-cria todas as páginas como 'pending'.
+    """Pré-cria páginas como 'pending' a partir de start_page.
 
     Idempotente: usa ON CONFLICT DO NOTHING para suportar re-execução
     quando total_pages muda (novas páginas são adicionadas, existentes mantidas).
 
+    Args:
+        pool: Pool de conexões.
+        execution_state_id: ID do estado da execução.
+        total_pages: Última página a criar.
+        start_page: Página inicial (padrão: 1).
+
     Returns:
         Número de páginas inseridas.
     """
-    if total_pages <= 0:
+    if total_pages <= 0 or start_page > total_pages:
         return 0
 
     async with pool.acquire() as conn:
         result = await conn.execute(
             """
             INSERT INTO crawl_pages (execution_state_id, page_number)
-            SELECT $1, generate_series(1, $2)
+            SELECT $1, generate_series($3::int, $2::int)
             ON CONFLICT (execution_state_id, page_number) DO NOTHING
             """,
             execution_state_id,
             total_pages,
+            start_page,
         )
         # result formato: "INSERT 0 N"
         try:

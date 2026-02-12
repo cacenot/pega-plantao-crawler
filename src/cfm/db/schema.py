@@ -132,6 +132,23 @@ CREATE INDEX IF NOT EXISTS idx_captcha_tokens_expires
     ON captcha_tokens (expires_at);
 """
 
+# ── Tabela de contagem por estado ──────────────────────────────
+
+STATE_COUNTS_TABLE = """
+CREATE TABLE IF NOT EXISTS state_counts (
+    id          SERIAL PRIMARY KEY,
+    state       VARCHAR(2)  NOT NULL UNIQUE,
+    api_total   INTEGER     NOT NULL DEFAULT 0,
+    db_total    INTEGER     NOT NULL DEFAULT 0,
+    missing     INTEGER     NOT NULL DEFAULT 0,
+    counted_at  TIMESTAMP   NOT NULL DEFAULT NOW()
+);
+"""
+
+STATE_COUNTS_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_state_counts_state ON state_counts (state);
+"""
+
 # ── Triggers ───────────────────────────────────────────────────
 
 UPDATE_TRIGGER = """
@@ -265,6 +282,10 @@ async def ensure_tables(pool: asyncpg.Pool) -> None:
         # Captcha tokens
         await conn.execute(CAPTCHA_TOKENS_TABLE)
         await conn.execute(CAPTCHA_TOKENS_INDEX)
+
+        # Contagem por estado
+        await conn.execute(STATE_COUNTS_TABLE)
+        await conn.execute(STATE_COUNTS_INDEX)
 
         # Triggers e migrations
         await conn.execute(UPDATE_TRIGGER)

@@ -1,4 +1,4 @@
-"""Crawler para buscar médicos no portal do CFM usando Playwright."""
+"""Crawler para buscar médicos no portal do CFM usando httpx."""
 
 import asyncio
 import json
@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 import asyncpg
-from playwright.async_api import Page, Response
+import httpx
 from pydantic import TypeAdapter
 
 from .db import captcha as captcha_db
@@ -74,6 +74,8 @@ def _build_search_payload(
     municipio: str = "",
     page: int = 1,
     page_size: int = 100,
+    tipo_inscricao: str = "",
+    situacao: str = "",
 ) -> list[dict]:
     """Monta o payload de busca de médicos."""
     return [
@@ -85,8 +87,8 @@ def _build_search_payload(
                 "ufMedico": uf,
                 "crmMedico": "",
                 "municipioMedico": municipio,
-                "tipoInscricaoMedico": "",
-                "situacaoMedico": "",
+                "tipoInscricaoMedico": tipo_inscricao,
+                "situacaoMedico": situacao,
                 "detalheSituacaoMedico": "",
                 "especialidadeMedico": "",
                 "areaAtuacaoMedico": "",
@@ -126,42 +128,38 @@ async def _get_captcha_ttl(db_pool: asyncpg.Pool) -> int:
     return await captcha_db.get_ttl(db_pool)
 
 
-async def _intercept_search_response(page: Page) -> dict:
-    """Intercepta a resposta da API buscar_medicos disparada pelo formulário."""
-    future: asyncio.Future[dict] = asyncio.get_event_loop().create_future()
-
-    async def _on_response(response: Response) -> None:
-        if "buscar_medicos" in response.url:
-            try:
-                data = await response.json()
-                if not future.done():
-                    future.set_result(data)
-            except Exception:
-                pass
-
-    page.on("response", _on_response)
-
-    result = await future
-    page.remove_listener("response", _on_response)
-    return result
+_HTTP_HEADERS = {
+    "Content-Type": "application/json",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Origin": CFM_BASE_URL,
+    "Referer": CFM_PAGE_URL,
+}
 
 
-async def _select_uf_and_search(page: Page, uf: str) -> None:
-    """Seleciona a UF no formulário de busca."""
-    await page.select_option('select[name="uf"]', uf)
-    await page.wait_for_timeout(500)
+def create_http_client(timeout: int = 120) -> httpx.AsyncClient:
+    """Cria um httpx.AsyncClient configurado para o portal do CFM."""
+    return httpx.AsyncClient(
+        headers=_HTTP_HEADERS,
+        timeout=httpx.Timeout(timeout, connect=15),
+    )
 
 
 async def fetch_medicos_page(
-    page: Page,
+    client: httpx.AsyncClient,
     captcha_token: str,
     uf: str,
     municipio: str = "",
     current_page: int = 1,
     page_size: int = 100,
     request_timeout: int = 120,
+    tipo_inscricao: str = "",
+    situacao: str = "",
 ) -> tuple[list[MedicoRaw], int]:
-    """Busca uma página de médicos via fetch no contexto do browser.
+    """Busca uma página de médicos via httpx POST.
 
     Returns:
         Tupla com (lista de MedicoRaw, total de registros).
@@ -172,39 +170,14 @@ async def fetch_medicos_page(
         municipio=municipio,
         page=current_page,
         page_size=page_size,
+        tipo_inscricao=tipo_inscricao,
+        situacao=situacao,
     )
 
-    js_timeout_ms = (request_timeout - 5) * 1000
-
     try:
-        data = await asyncio.wait_for(
-            page.evaluate(
-                """async ([url, payload, timeoutMs]) => {
-                    const controller = new AbortController();
-                    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-
-                    try {
-                        const resp = await fetch(url, {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify(payload),
-                            signal: controller.signal
-                        });
-                        clearTimeout(timeoutId);
-                        return await resp.json();
-                    } catch (error) {
-                        clearTimeout(timeoutId);
-                        if (error.name === 'AbortError') {
-                            throw new Error(`Request timeout (${timeoutMs}ms)`);
-                        }
-                        throw error;
-                    }
-                }""",
-                [CFM_BUSCA_URL, payload, js_timeout_ms],
-            ),
-            timeout=request_timeout,
-        )
-    except asyncio.TimeoutError:
+        resp = await client.post(CFM_BUSCA_URL, json=payload, timeout=request_timeout)
+        data = resp.json()
+    except httpx.TimeoutException:
         raise Exception(
             f"Timeout de {request_timeout}s ao buscar página {current_page} da UF {uf}"
         )
@@ -225,43 +198,16 @@ async def fetch_medicos_page(
 
 
 async def fetch_foto_medico(
-    page: Page,
+    client: httpx.AsyncClient,
     crm: str,
     uf: str,
     security_hash: str,
 ) -> MedicoFotoRaw | None:
-    """Busca os detalhes/foto de um médico via POST no contexto do browser."""
+    """Busca os detalhes/foto de um médico via httpx POST."""
     try:
         payload = [{"securityHash": security_hash, "crm": crm, "uf": uf}]
-        data = await page.evaluate(
-            """async ([url, payload, timeoutMs]) => {
-                const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-
-                try {
-                    const resp = await fetch(url, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(payload),
-                        signal: controller.signal
-                    });
-                    clearTimeout(timeoutId);
-                    const text = await resp.text();
-                    try {
-                        return JSON.parse(text);
-                    } catch {
-                        return { status: 'erro', mensagem: text };
-                    }
-                } catch (error) {
-                    clearTimeout(timeoutId);
-                    if (error.name === 'AbortError') {
-                        return { status: 'erro', mensagem: `Timeout após ${timeoutMs}ms` };
-                    }
-                    throw error;
-                }
-            }""",
-            [CFM_FOTO_URL, payload, 30000],
-        )
+        resp = await client.post(CFM_FOTO_URL, json=payload, timeout=30)
+        data = resp.json()
 
         if data.get("status") == "sucesso" and data.get("dados"):
             return MedicoFotoRaw(**data["dados"][0])
@@ -269,6 +215,55 @@ async def fetch_foto_medico(
         print(f"⚠️ Erro ao buscar foto CRM {crm}/{uf}: {e}")
 
     return None
+
+
+async def fetch_all_state_counts(
+    captcha_token: str,
+) -> dict[str, int]:
+    """Busca o total de médicos de cada UF em paralelo via httpx (sem browser).
+
+    Dispara 27 requests simultâneas — uma por estado, pageSize=1 —
+    apenas para obter o campo COUNT da API.
+
+    Returns:
+        Dict mapeando UF -> total de registros na API.
+    """
+    import httpx
+
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        ),
+        "Origin": CFM_BASE_URL,
+        "Referer": CFM_PAGE_URL,
+    }
+
+    async def _fetch_count(client: httpx.AsyncClient, uf: str) -> tuple[str, int]:
+        payload = _build_search_payload(
+            captcha_token=captcha_token,
+            uf=uf,
+            page=1,
+            page_size=1,
+        )
+        try:
+            resp = await client.post(CFM_BUSCA_URL, json=payload, timeout=30)
+            data = resp.json()
+            if data.get("status") != "sucesso":
+                print(f"⚠️  API erro para UF {uf}: {data}")
+                return uf, -1
+            dados = data.get("dados", [])
+            total = int(dados[0].get("COUNT", 0)) if dados else 0
+            return uf, total
+        except Exception as e:
+            print(f"⚠️  Erro ao contar UF {uf}: {e}")
+            return uf, -1
+
+    async with httpx.AsyncClient(headers=headers) as client:
+        results = await asyncio.gather(*[_fetch_count(client, uf) for uf in UFS])
+    return {uf: total for uf, total in results}
 
 
 def _format_doctor_for_db(
@@ -304,12 +299,14 @@ def _format_doctor_for_db(
 
 
 async def _fetch_batch(
-    page: Page,
+    client: httpx.AsyncClient,
     captcha_token: str,
     uf: str,
     pages: list[int],
     page_size: int,
     request_timeout: int = 120,
+    tipo_inscricao: str = "",
+    situacao: str = "",
 ) -> list[tuple[int, list[MedicoRaw], int]]:
     """Busca várias páginas em paralelo.
 
@@ -318,12 +315,14 @@ async def _fetch_batch(
     """
     tasks = [
         fetch_medicos_page(
-            page=page,
+            client=client,
             captcha_token=captcha_token,
             uf=uf,
             current_page=p,
             page_size=page_size,
             request_timeout=request_timeout,
+            tipo_inscricao=tipo_inscricao,
+            situacao=situacao,
         )
         for p in pages
     ]
@@ -355,12 +354,14 @@ async def _fetch_batch(
         for p in failed_pages:
             try:
                 medicos, total_count = await fetch_medicos_page(
-                    page=page,
+                    client=client,
                     captcha_token=captcha_token,
                     uf=uf,
                     current_page=p,
                     page_size=page_size,
                     request_timeout=request_timeout,
+                    tipo_inscricao=tipo_inscricao,
+                    situacao=situacao,
                 )
                 successful.append((p, medicos, total_count))
                 print(f"   ✅ Página {p} recuperada no retry {retry_attempt}")
@@ -377,7 +378,7 @@ async def _fetch_batch(
 
 
 async def crawl_state(
-    page: Page,
+    client: httpx.AsyncClient,
     uf: str,
     execution_state_id: int,
     db_pool: asyncpg.Pool,
@@ -387,6 +388,9 @@ async def crawl_state(
     max_results: int = 0,
     request_timeout: int = 120,
     batch_size: int = 5,
+    tipo_inscricao: str = "",
+    situacao: str = "",
+    start_page: int = 1,
 ) -> int:
     """Crawla todos os médicos de uma UF usando o plano de execução.
 
@@ -467,12 +471,14 @@ async def crawl_state(
 
         try:
             results = await _fetch_batch(
-                page=page,
+                client=client,
                 captcha_token=captcha_token,
                 uf=uf,
                 pages=pending_pages,
                 page_size=page_size,
                 request_timeout=request_timeout,
+                tipo_inscricao=tipo_inscricao,
+                situacao=situacao,
             )
             batch_time = time.time() - batch_start
             batch_times.append(batch_time)
@@ -530,7 +536,10 @@ async def crawl_state(
                     total_pages = new_total_pages
                     # Pré-criar/atualizar páginas no banco
                     inserted = await initialize_pages(
-                        db_pool, execution_state_id, total_pages
+                        db_pool,
+                        execution_state_id,
+                        total_pages,
+                        start_page=start_page,
                     )
                     await update_execution_state(
                         db_pool,
@@ -685,7 +694,7 @@ async def crawl_state(
 
 
 async def run_execution(
-    page: Page,
+    client: httpx.AsyncClient,
     execution_id: int,
     db_pool: asyncpg.Pool,
     page_size: int = 1000,
@@ -694,6 +703,9 @@ async def run_execution(
     fetch_fotos: bool = True,
     max_results: int = 0,
     request_timeout: int = 120,
+    tipo_inscricao: str = "",
+    situacao: str = "",
+    start_page: int = 1,
 ) -> int:
     """Executa um plano de execução completo.
 
@@ -722,7 +734,7 @@ async def run_execution(
 
             try:
                 count = await crawl_state(
-                    page=page,
+                    client=client,
                     uf=uf,
                     execution_state_id=state_id,
                     db_pool=db_pool,
@@ -732,6 +744,9 @@ async def run_execution(
                     max_results=max_results,
                     request_timeout=request_timeout,
                     batch_size=batch_size,
+                    tipo_inscricao=tipo_inscricao,
+                    situacao=situacao,
+                    start_page=start_page,
                 )
                 total_medicos += count
 
