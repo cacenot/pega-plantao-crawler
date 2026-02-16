@@ -3,6 +3,7 @@
 Comandos:
     token          — Resolver reCAPTCHA e cachear token no PostgreSQL
     doctors        — Crawlar médicos (todos, por estado ou por CRM)
+    specialties    — Sincronizar especialidades (doctors → specialties)
 
 Exemplos:
     cfm-crawler token
@@ -12,6 +13,7 @@ Exemplos:
     cfm-crawler doctors --crm 12345 --uf SP
     cfm-crawler doctors --count
     cfm-crawler doctors --count --state SP
+    cfm-crawler specialties
 """
 
 from __future__ import annotations
@@ -62,6 +64,15 @@ def token(
     with get_session() as session:
         use_case = ManageTokenUseCase(session, settings)
         use_case.execute(loop=loop)
+
+
+# ── specialties ────────────────────────────────────────────────
+
+
+@app.command()
+def specialties() -> None:
+    """Sincronizar especialidades: extrai da tabela doctors e popula specialties."""
+    _run_sync_specialties()
 
 
 # ── doctors ────────────────────────────────────────────────────
@@ -132,6 +143,34 @@ def doctors(
 
 
 # ── Implementações internas ────────────────────────────────────
+
+
+def _run_sync_specialties() -> None:
+    """Extrai especialidades dos doctors e popula a tabela specialties."""
+    from .config import get_cfm_settings
+    from ..database.session import get_session
+    from .use_cases.sync_specialties import SyncSpecialtiesUseCase
+
+    settings = get_cfm_settings()
+    _init_db(settings.database_url)
+
+    print("=" * 60)
+    print("🏷️  CFM Crawler - Sincronização de Especialidades")
+    print("=" * 60)
+    print("   Fonte:  tabela doctors (JSONB specialties)")
+    print("   Destino: tabela specialties (TRUNCATE + INSERT)")
+    print("-" * 60)
+
+    with get_session() as session:
+        use_case = SyncSpecialtiesUseCase(session, settings)
+        count = use_case.execute()
+
+    if count == 0:
+        print("\n⚠️  Nenhuma especialidade encontrada na tabela doctors.")
+        print("   Execute o crawl primeiro: cfm-crawler doctors")
+    else:
+        print(f"\n✅ {count} especialidades sincronizadas com sucesso!")
+    print("=" * 60)
 
 
 def _run_count(state: str | None) -> None:

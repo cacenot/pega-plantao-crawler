@@ -69,9 +69,11 @@ class Specialty(Base):
     """Especialidade médica única."""
 
     __tablename__ = "specialties"
+    __table_args__ = (UniqueConstraint("code", name="uq_specialties_code"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, init=False)
     name: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    code: Mapped[str] = mapped_column(String(255), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), init=False
     )
